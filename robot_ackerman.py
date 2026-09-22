@@ -1205,37 +1205,42 @@ def update(frame):
 
         # --- U-TURN FULL-LOCK (posisi ditempel persis ke lengkung asli di `path`, waktu murni) ---
         in_uturn_zone = any(lo <= current_seg <= hi for (lo, hi) in uturn_ranges)
-        if USE_HARDWARE:
-            if not uturn_active and in_uturn_zone and abs(math.degrees(steer_cmd)) > UTURN_ENGAGE_DEG:
-                uturn_active = True
-                uturn_direction = 'R' if steer_cmd > 0 else 'L'
-                uturn_start_time = sim_elapsed
-                uturn_zone_lo, uturn_zone_hi = next((lo, hi) for (lo, hi) in uturn_ranges if lo <= current_seg <= hi)
-            if uturn_active:
-                uturn_elapsed = sim_elapsed - uturn_start_time
-                duration = UTURN_DURATION_S[uturn_direction]
-                if uturn_elapsed < duration:
-                    steer = max_steer if uturn_direction == 'R' else -max_steer
-                    prev_steer = steer
-                    # Posisi & arah simulasi dihitung dari rumus geometri lingkaran yang PERSIS
-                    # SAMA dengan yang dipakai generate_seed_filler_path() bikin titik cyan —
-                    # pusat & radius diambil dari titik ujung baris (uturn_zone_lo, titik pasti/
-                    # tidak meleset), disapu berdasar fraksi waktu murni. Dijamin bentuknya sama
-                    # persis dengan lengkung cyan, tidak lagi bergantung index current_seg.
-                    frac = min(1.0, uturn_elapsed / duration)
-                    uturn_r = ROW_SPACING / 2.0
-                    cx, cy0 = path[uturn_zone_lo][0], path[uturn_zone_lo][1] + uturn_r
-                    if uturn_direction == 'L':
-                        a = -math.pi / 2 + math.pi * frac   # CCW, menggembung +x (tepi kanan)
-                        pyaw = a + math.pi / 2
-                    else:
-                        a = -math.pi / 2 - math.pi * frac   # CW, menggembung -x (tepi kiri)
-                        pyaw = a - math.pi / 2
-                    px = cx + uturn_r * math.cos(a)
-                    py = cy0 + uturn_r * math.sin(a)
-                    uturn_pose_override = (px, py, pyaw)
+        if not uturn_active and in_uturn_zone and abs(math.degrees(steer_cmd)) > UTURN_ENGAGE_DEG:
+            uturn_active = True
+            uturn_direction = 'R' if steer_cmd > 0 else 'L'
+            uturn_start_time = sim_elapsed
+            uturn_zone_lo, uturn_zone_hi = next((lo, hi) for (lo, hi) in uturn_ranges if lo <= current_seg <= hi)
+        if uturn_active:
+            uturn_elapsed = sim_elapsed - uturn_start_time
+            duration = UTURN_DURATION_S[uturn_direction]
+            if uturn_elapsed < duration:
+                steer = max_steer if uturn_direction == 'R' else -max_steer
+                prev_steer = steer
+                # Posisi & arah simulasi dihitung dari rumus geometri lingkaran yang PERSIS
+                # SAMA dengan yang dipakai generate_seed_filler_path() bikin titik cyan —
+                # pusat & radius diambil dari titik ujung baris (uturn_zone_lo, titik pasti/
+                # tidak meleset), disapu berdasar fraksi waktu murni. Dijamin bentuknya sama
+                # persis dengan lengkung cyan, tidak lagi bergantung index current_seg.
+                frac = min(1.0, uturn_elapsed / duration)
+                uturn_r = ROW_SPACING / 2.0
+                cx, cy0 = path[uturn_zone_lo][0], path[uturn_zone_lo][1] + uturn_r
+                if uturn_direction == 'L':
+                    a = -math.pi / 2 + math.pi * frac   # CCW, menggembung +x (tepi kanan)
+                    pyaw = a + math.pi / 2
                 else:
-                    uturn_active = False
+                    a = -math.pi / 2 - math.pi * frac   # CW, menggembung -x (tepi kiri)
+                    pyaw = a - math.pi / 2
+                px = cx + uturn_r * math.cos(a)
+                py = cy0 + uturn_r * math.sin(a)
+                uturn_pose_override = (px, py, pyaw)
+                # current_seg dipaksa ikut maju bareng frac — kalau tidak, pure-pursuit
+                # nyari titik incar dari index LAMA (masih nyangkut di lengkungan) padahal
+                # posisi robot sudah jauh di depan -> bikin dia "nyari ke belakang"/nyasar
+                # balik ke row pertama begitu full-lock lepas.
+                current_seg = int(uturn_zone_lo + frac * (uturn_zone_hi - uturn_zone_lo))
+            else:
+                uturn_active = False
+                current_seg = uturn_zone_hi  # pastikan lepas full-lock pas mulai dari baris baru, bukan nyangkut di lengkungan
 
         servo_deg = map_steering_to_servo(steer, max_steer)
         if USE_HARDWARE and abs(steer) > math.radians(5):
@@ -1346,7 +1351,7 @@ def update(frame):
         if USE_HARDWARE:
             # Servo selalu dikirim — terpisah dari kondisi motor
             send_servo_command(servo_deg)
-            if motor_on and v_cmd > 0.01:
+            if motor_on and (v_cmd > 0.01 or uturn_active):
                 send_motor_command(current_pwm, motor_dir)
             else:
                 send_stop_command()
@@ -1542,5 +1547,5 @@ def on_close(event):
 
 fig.canvas.mpl_connect('close_event', on_close)
 
-ani = animation.FuncAnimation(fig, update, frames=None, interval=0, blit=False, cache_frame_data=False)
+ani = animation.FuncAnimation(fig, update, frames=None, interval=16, blit=True, cache_frame_data=False)
 plt.show()

@@ -1305,12 +1305,16 @@ def update(frame):
                         yaw += utest_enc_w_angular * real_dt
                         while yaw > math.pi: yaw -= 2*math.pi
                         while yaw < -math.pi: yaw += 2*math.pi
+                elif uturn_pose_override is not None:
+                    # U-turn full-lock aktif juga di mode U-TURN TEST (SIM) — pakai posisi
+                    # arc geometri yang sudah dihitung, jangan lewat simulasi encoder biasa.
+                    rear_x, rear_y, yaw = uturn_pose_override
                 else:
                     # ============================================
                     # SIM: Simulasi pembacaan encoder + noise
                     # ============================================
                     tan_steer = math.tan(steer) if abs(steer) < math.radians(89) else math.copysign(100, steer)
-                    
+
                     if abs(tan_steer) > 0.001:
                         R = WHEELBASE / tan_steer
                         abs_R = abs(R)

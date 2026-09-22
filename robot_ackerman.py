@@ -649,6 +649,7 @@ def start_hw(event):
 
 def start_sim(event):
     global is_running, USE_HARDWARE, robot_mode, session_data, sf_state, sim_elapsed
+    global uturn_active, uturn_direction
     if not utest_active and sf_state == SF_DONE:
         print("[SIM] Path sudah selesai, klik RESET dulu.")
         return
@@ -657,6 +658,7 @@ def start_sim(event):
     robot_mode = "UTEST_SIM" if utest_active else "SIM"
     sim_elapsed = 0.0
     sf_state = SF_MOVING
+    uturn_active = False; uturn_direction = None
     stop_hw_threads()
     print(f"[START] Mode: {robot_mode}")
 

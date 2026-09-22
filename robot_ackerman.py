@@ -1207,7 +1207,10 @@ def update(frame):
         uturn_pose_override = None  # kalau ada isinya (x,y,yaw): posisi simulasi dipaksa persis di situ
 
         # --- U-TURN FULL-LOCK (posisi ditempel persis ke lengkung asli di `path`, waktu murni) ---
-        in_uturn_zone = any(lo <= current_seg <= hi for (lo, hi) in uturn_ranges)
+        # batas atas EXCLUSIVE (< bukan <=) — begitu U-turn selesai, current_seg dipatok
+        # persis di uturn_zone_hi; kalau <= dipakai, titik itu masih dianggap "di dalam zona"
+        # dan bisa langsung trigger ulang U-turn yang sama sesaat setelah lepas full-lock.
+        in_uturn_zone = any(lo <= current_seg < hi for (lo, hi) in uturn_ranges)
         if not uturn_active and in_uturn_zone and abs(math.degrees(steer_cmd)) > UTURN_ENGAGE_DEG:
             uturn_active = True
             uturn_direction = 'R' if steer_cmd > 0 else 'L'

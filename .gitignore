@@ -1,0 +1,8 @@
+# File CAD (besar, tidak perlu di-track)
+*.SLDPRT
+*.SLDASM
+*.STEP
+*.STL
+
+__pycache__/
+*.pyc

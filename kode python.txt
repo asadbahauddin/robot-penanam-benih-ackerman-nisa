@@ -1,0 +1,1478 @@
+import math, time
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.animation as animation
+import matplotlib.transforms as transforms
+import requests
+import cv2
+from collections import deque
+from matplotlib.widgets import Button, TextBox
+import csv
+import datetime
+import threading
+from queue import Queue, Empty
+import matplotlib.cbook as _cbook
+_OrigCallbackRegistry = _cbook.CallbackRegistry
+
+class _SafeCallbackRegistry(_OrigCallbackRegistry):
+    def process(self, s, *args, **kwargs):
+        if args and not hasattr(args[0], 'inaxes'):
+            if 'button' in s or 'motion' in s or 'scroll' in s:
+                return
+        super().process(s, *args, **kwargs)
+
+_cbook.CallbackRegistry = _SafeCallbackRegistry
+
+cap = None
+CAM_INDEX = 1
+use_aruco_tracking = False
+ARUCO_ID = 42
+
+try:
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    aruco_params = cv2.aruco.DetectorParameters()
+    aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+    def detect_aruco(frame):
+        corners, ids, _ = aruco_detector.detectMarkers(frame)
+        return corners, ids
+except AttributeError:
+    aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
+    aruco_params = cv2.aruco.DetectorParameters_create()
+    def detect_aruco(frame):
+        corners, ids, _ = cv2.aruco.detectMarkers(frame, aruco_dict, parameters=aruco_params)
+        return corners, ids
+
+ROBOT_IP = "http://192.168.4.1"
+USE_HARDWARE = False  
+INVERT_MOTOR = False
+INVERT_STEER = False  # diset False — steering sudah benar di kode Mega
+WHEEL_RADIUS = 0.032465  
+GEAR_RATIO = 1.0
+AREA_W = 5.0           
+AREA_H = 7.5
+PATH_MARGIN_X = 0.5     
+PATH_MARGIN_Y = 0.5     
+ROW_COUNT = 6
+ROW_SPACING = 1.2       
+PLOT_FIT_MARGIN = 0.4   
+WHEELBASE = 0.2365        
+BODY_LEN = 0.38415        
+BODY_WID = 0.09622        
+WHEEL_LEN = 0.06493       
+WHEEL_WID = 0.033         
+V_BASE = 0.2
+DT = 1.0 / 60.0
+LOOKAHEAD = 0.8          
+MAX_STEER_DEG = 60.0
+MAX_STEER_RATE = math.radians(100.0) 
+SERVO_CENTER = 75
+SERVO_LEFT_LIMIT = 50
+SERVO_RIGHT_LIMIT = 110    
+MOTOR_PWM_MAX = 255
+GOAL_TOL = 0.12
+WAYPOINT_TOL = 0.18
+MAX_SEG_LOOK = 30
+PLANT_SPACING = 0.8
+MIN_STRAIGHT_LEN = 1.2
+CORNER_AVOID_DIST = 1.2
+STEPPER_MAX_STEPS = 1380  # hasil kalibrasi: 0=home/naik penuh, 1380=turun penuh (posisi ngebor)
+STEPPER_DOWN_TIME = 2.2  # 1380 step * 1500us/step ≈ 2.07s fisik, dikasih margin
+STEPPER_UP_TIME = 2.2    # jarak & kecepatan sama dengan turun
+STEPPER_HOLD_TIME = 0.15
+STEPPER_WAIT_TIME = 0.2
+
+# --- BENIH CONSTANTS ---
+BENIH_TUTUP  = 45   # posisi tutup (default)
+BENIH_BUKA   = 95   # posisi buka
+BENIH_BUKA_TIME   = 0.5   # detik tunggu setelah buka
+BENIH_DORONG_TIME = 0.05  # detik tunggu setelah dorong (cepat)
+MAX_TRAJ_POINTS = 5000
+UTURN_ARC_POINTS = 24
+
+# ============================================================
+# Variabel U-Turn Test Mode
+# ============================================================
+utest_active = False
+utest_enc_noise = 0.003
+utest_enc_v_left = 0.0
+utest_enc_v_right = 0.0
+utest_enc_v_linear = 0.0
+utest_enc_w_angular = 0.0
+utest_drift = 0.0
+utest_max_drift = 0.0
+utest_avg_drift = 0.0
+utest_drift_samples = 0.0
+utest_drift_sum = 0.0
+ideal_x = 0.0
+ideal_y = 0.0
+ideal_yaw = 0.0
+utest_hw_rpm1 = 0
+utest_hw_rpm2 = 0
+utest_hw_enc1 = 0
+utest_hw_enc2 = 0
+
+SF_MOVING       = "MOVING"
+SF_APPROACHING  = "APPROACHING"
+SF_STOPPING     = "STOPPING"
+SF_STEPPER_DOWN = "STEPPER_DOWN"
+SF_BENIH_BUKA   = "BENIH_BUKA"    # BARU: servo buka 95°
+SF_BENIH_DORONG = "BENIH_DORONG"  # BARU: servo dorong+tutup 45°
+SF_HOLDING      = "HOLDING"
+SF_STEPPER_UP   = "STEPPER_UP"
+SF_WAITING      = "WAITING"
+SF_DONE         = "DONE"
+SF_IDLE         = "IDLE"
+HISTORY_LEN = 100
+history_v = deque([0]*HISTORY_LEN, maxlen=HISTORY_LEN)
+history_enc1 = deque([0]*HISTORY_LEN, maxlen=HISTORY_LEN) 
+history_enc2 = deque([0]*HISTORY_LEN, maxlen=HISTORY_LEN) 
+history_servo = deque([0]*HISTORY_LEN, maxlen=HISTORY_LEN)
+history_stepper = deque([0]*HISTORY_LEN, maxlen=HISTORY_LEN)
+is_running = False
+robot_online = False
+robot_mode = "IDLE" 
+record_session = False
+session_data = [] 
+sf_state = SF_IDLE
+plant_points = []
+current_plant_idx = 0
+planted_points = []
+plant_count = 0
+total_plant_points = 0
+stepper_pos = 0.0
+stepper_timer = 0.0
+stop_timer = 0.0
+current_seg = 0
+current_pwm = 0
+servo_deg = SERVO_CENTER
+motor_dir = 0
+last_look_point = None
+hw_stepper_down_sent = False
+hw_stepper_up_sent   = False
+hw_benih_buka_sent   = False
+hw_benih_dorong_sent = False
+hw_last_cmd_sent = ""
+hw_last_servo_sent = ""
+hw_last_motor_sent = ""
+hw_cmd_success = False
+hw_cmd_count = 0
+hw_fail_count = 0
+http_session = requests.Session()
+grid_lines = []
+path_line = None
+path_scatter = None
+area_rect = None
+last_update_time = time.perf_counter()
+fps_smooth = 0.0
+loop_count = 0
+fps_timer = time.perf_counter()
+sim_elapsed = 0.0
+action_cmd_queue = Queue()
+hw_state_lock = threading.Lock()
+hw_target_servo = SERVO_CENTER
+hw_target_pwm = 0
+hw_target_dir = 0
+hw_is_stopped = True
+HW_STATE_HZ = 3.0  # 1 kirim per ~333ms agar ESP tidak kewalahan
+odom_lock = threading.Lock()
+latest_odom = [0.0, 0.0, 90.0, 0.0, False, 0, 0, 0, 0]
+hw_sender_running = False
+hw_reader_running = False
+hw_send_rate = 0.0
+hw_read_rate = 0.0
+hw_send_count_thread = 0
+hw_read_count_thread = 0
+hw_rate_timer = time.perf_counter()
+hw_send_count_snapshot = 0
+hw_read_count_snapshot = 0
+
+def _http_get(cmd):
+    global hw_cmd_success, hw_cmd_count, hw_fail_count, hw_send_count_thread, hw_last_cmd_sent
+    hw_last_cmd_sent = cmd
+    try:
+        r = http_session.get(f"{ROBOT_IP}/cmd", params={'c': cmd}, timeout=0.5,
+                              headers={'Connection': 'close'})
+        if r.status_code == 200:
+            hw_cmd_success = True; hw_cmd_count += 1
+        else:
+            hw_cmd_success = False; hw_fail_count += 1
+    except Exception:
+        hw_cmd_success = False; hw_fail_count += 1
+    hw_send_count_thread += 1
+
+DEBUG_DISABLE_MOTOR_SEND = False  # TES ISOLASI: True = jangan kirim MOTOR/STOP sama sekali (SERVO tetap jalan)
+
+def hw_sender_loop():
+    state_interval = 1.0 / HW_STATE_HZ
+    last_state_time = 0
+    loop_ctr = 0
+    while hw_sender_running:
+        now = time.perf_counter()
+        sent = False
+        try:
+            cmd = action_cmd_queue.get_nowait()
+            _http_get(cmd)
+            sent = True
+        except Empty:
+            pass
+        if not sent and (now - last_state_time >= state_interval):
+            with hw_state_lock:
+                is_stopped_now = hw_is_stopped
+                servo_now      = hw_target_servo
+                pwm_now        = hw_target_pwm
+                dir_now        = hw_target_dir
+            loop_ctr += 1
+            if loop_ctr % 5 == 0:
+                print(f"[HW_LOOP] stopped={is_stopped_now} servo={servo_now} pwm={pwm_now}")
+            # Servo selalu dikirim dulu — tidak peduli motor stop atau tidak
+            _http_get(f"SERVO,{servo_now}")
+            hw_last_servo_sent = f"SERVO,{servo_now}"
+            if DEBUG_DISABLE_MOTOR_SEND:
+                if loop_ctr % 5 == 0:
+                    print("[HW_LOOP] DEBUG_DISABLE_MOTOR_SEND aktif — MOTOR/STOP TIDAK dikirim")
+            else:
+                time.sleep(0.03)
+                if is_stopped_now:
+                    _http_get("STOP")
+                else:
+                    actual_dir = 0 if (INVERT_MOTOR and dir_now == 1) else dir_now
+                    _http_get(f"MOTOR,{pwm_now},{actual_dir},{pwm_now},{actual_dir}")
+                    hw_last_motor_sent = f"MOTOR,{pwm_now},{actual_dir}"
+            last_state_time = now
+            sent = True
+        if not sent:
+            time.sleep(0.002)
+
+HW_READ_HZ = 5.0  # dibatasi — sebelumnya tanpa jeda sama sekali, membanjiri ESP8266WebServer yang single-threaded
+
+def hw_reader_loop():
+    global robot_online, hw_read_count_thread
+    read_interval = 1.0 / HW_READ_HZ
+    while hw_reader_running:
+        loop_start = time.perf_counter()
+        if not USE_HARDWARE:
+            time.sleep(0.01); continue
+        try:
+            r = http_session.get(f"{ROBOT_IP}/data", timeout=0.5)
+            if r.status_code == 200:
+                data = r.json()
+                enc1 = int(data.get('enc1', 0)); enc2 = int(data.get('enc2', 0))
+                rpm1 = int(data.get('rpm1', 0)); rpm2 = int(data.get('rpm2', 0))
+                servo_current = int(data.get('servo', 90)); stepper_raw = int(data.get('stepper', 0))
+                v_left = (rpm1 * 2 * math.pi * WHEEL_RADIUS) / (60 * GEAR_RATIO)
+                v_right = (rpm2 * 2 * math.pi * WHEEL_RADIUS) / (60 * GEAR_RATIO)
+                v_linear = (v_left + v_right) / 2.0
+                w_angular = (v_right - v_left) / WHEELBASE
+                stepper_norm = min(1.0, max(0.0, stepper_raw / STEPPER_MAX_STEPS)) if STEPPER_MAX_STEPS > 0 else 0.0
+                robot_online = True
+                with odom_lock:
+                    latest_odom[:] = [v_linear, w_angular, servo_current, stepper_norm, True, enc1, enc2, rpm1, rpm2]
+            else:
+                robot_online = False
+        except Exception:
+            robot_online = False
+        hw_read_count_thread += 1
+        remaining = read_interval - (time.perf_counter() - loop_start)
+        if remaining > 0:
+            time.sleep(remaining)
+
+def start_hw_threads():
+    global hw_sender_running, hw_reader_running
+    if not hw_sender_running:
+        hw_sender_running = True
+        threading.Thread(target=hw_sender_loop, daemon=True).start()
+    if not hw_reader_running:
+        hw_reader_running = True
+        threading.Thread(target=hw_reader_loop, daemon=True).start()
+
+def stop_hw_threads():
+    global hw_sender_running, hw_reader_running
+    hw_sender_running = False; hw_reader_running = False
+
+def update_hw_rates():
+    global hw_send_rate, hw_read_rate, hw_rate_timer
+    global hw_send_count_snapshot, hw_read_count_snapshot
+    now = time.perf_counter()
+    elapsed = now - hw_rate_timer
+    if elapsed >= 0.5:
+        hw_send_rate = (hw_send_count_thread - hw_send_count_snapshot) / elapsed
+        hw_read_rate = (hw_read_count_thread - hw_read_count_snapshot) / elapsed
+        hw_send_count_snapshot = hw_send_count_thread
+        hw_read_count_snapshot = hw_read_count_thread
+        hw_rate_timer = now
+
+def send_servo_command(angle):
+    global hw_target_servo
+    if not USE_HARDWARE: return True
+    with hw_state_lock:
+        hw_target_servo = int(angle)
+    return True
+
+def send_motor_command(pwm, direction):
+    global hw_target_pwm, hw_target_dir, hw_is_stopped
+    if not USE_HARDWARE: return True
+    with hw_state_lock:
+        hw_target_pwm = max(0, min(MOTOR_PWM_MAX, abs(int(pwm))))
+        hw_target_dir = direction
+        hw_is_stopped = False
+    return True
+
+def send_stop_command():
+    global hw_is_stopped
+    if not USE_HARDWARE: return True
+    with hw_state_lock:
+        hw_is_stopped = True
+    return True
+
+def send_stepper_command(steps):
+    if not USE_HARDWARE: return True
+    action_cmd_queue.put(f"STEPPER,{steps}")
+    return True
+
+def send_to_esp_force(command_string):
+    global hw_last_cmd_sent, hw_cmd_success, hw_cmd_count, hw_fail_count
+    hw_last_cmd_sent = command_string
+    while not action_cmd_queue.empty():
+        try: action_cmd_queue.get_nowait()
+        except Empty: break
+    try:
+        r = http_session.get(f"{ROBOT_IP}/cmd", params={'c': command_string}, timeout=1.0)
+        if r.status_code == 200: hw_cmd_success = True; hw_cmd_count += 1; return True
+        else: hw_cmd_success = False; hw_fail_count += 1
+    except: hw_cmd_success = False; hw_fail_count += 1
+    return False
+
+def get_odometry():
+    global robot_online
+    if not USE_HARDWARE:
+        robot_online = False
+        return 0.0, 0.0, 90.0, 0.0, False, 0, 0, 0, 0
+    with odom_lock:
+        return tuple(latest_odom)
+
+def generate_seed_filler_path():
+    pts = []
+    if ROW_COUNT < 1: return np.array([(PATH_MARGIN_X, PATH_MARGIN_Y)], dtype=float)
+    rows_y = [PATH_MARGIN_Y + i * ROW_SPACING for i in range(ROW_COUNT)]
+    x_left  = PATH_MARGIN_X
+    x_right = max(PATH_MARGIN_X + 0.1, AREA_W - PATH_MARGIN_X)
+    uturn_r = ROW_SPACING / 2.0
+    n_arc = UTURN_ARC_POINTS
+    for i, y in enumerate(rows_y):
+        if i % 2 == 0:
+            pts.append((x_left, y)); pts.append((x_right, y))
+        else:
+            pts.append((x_right, y)); pts.append((x_left, y))
+        if i < ROW_COUNT - 1:
+            cy = y + uturn_r
+            if i % 2 == 0:
+                for j in range(1, n_arc):
+                    a = -math.pi / 2 + math.pi * j / n_arc
+                    pts.append((x_right + uturn_r * math.cos(a), cy + uturn_r * math.sin(a)))
+            else:
+                for j in range(1, n_arc):
+                    a = 3 * math.pi / 2 - math.pi * j / n_arc
+                    pts.append((x_left + uturn_r * math.cos(a), cy + uturn_r * math.sin(a)))
+    return np.array(pts, dtype=float)
+
+def generate_uturn_test_path():
+    test_rows = 5
+    rows_y = [PATH_MARGIN_Y + i * ROW_SPACING for i in range(test_rows)]
+    x_left = PATH_MARGIN_X
+    x_right = max(PATH_MARGIN_X + 0.1, AREA_W - PATH_MARGIN_X)
+    uturn_r = ROW_SPACING / 2.0
+    n_arc = UTURN_ARC_POINTS
+    pts = []
+    for i, y in enumerate(rows_y):
+        if i % 2 == 0:
+            pts.append((x_left, y)); pts.append((x_right, y))
+        else:
+            pts.append((x_right, y)); pts.append((x_left, y))
+        if i < test_rows - 1:
+            cy = y + uturn_r
+            if i % 2 == 0:
+                for j in range(1, n_arc):
+                    a = -math.pi / 2 + math.pi * j / n_arc
+                    pts.append((x_right + uturn_r * math.cos(a), cy + uturn_r * math.sin(a)))
+            else:
+                for j in range(1, n_arc):
+                    a = 3 * math.pi / 2 - math.pi * j / n_arc
+                    pts.append((x_left + uturn_r * math.cos(a), cy + uturn_r * math.sin(a)))
+    return np.array(pts, dtype=float)
+
+def calculate_turn_angles(path):
+    n = len(path); angles = []
+    for i in range(n - 1): angles.append(math.atan2(path[i+1][1] - path[i][1], path[i+1][0] - path[i][0]))
+    turn_angles = [0.0]
+    for i in range(1, len(angles)):
+        diff = angles[i] - angles[i-1]
+        while diff > math.pi: diff -= 2*math.pi
+        while diff < -math.pi: diff += 2*math.pi
+        turn_angles.append(abs(diff))
+    turn_angles.append(0.0); return turn_angles
+
+def generate_plant_points_on_path(path, spacing, corner_avoid):
+    turn_angles = calculate_turn_angles(path); plant_pts = []; n = len(path)
+    for i in range(n - 1):
+        x1, y1 = path[i]; x2, y2 = path[i+1]; seg_len = math.hypot(x2-x1, y2-y1)
+        if seg_len < MIN_STRAIGHT_LEN: continue
+        dx, dy = x2-x1, y2-y1; margin = corner_avoid
+        if margin * 2 >= seg_len: continue
+        effective_len = seg_len - (margin * 2); num_plants = int(effective_len / spacing)
+        if num_plants <= 0: continue
+        for j in range(num_plants):
+            t = (margin + (j + 0.5) * spacing) / seg_len; plant_pts.append((x1 + t*dx, y1 + t*dy))
+    return plant_pts
+
+path = generate_seed_filler_path()
+plant_points = generate_plant_points_on_path(path, PLANT_SPACING, CORNER_AVOID_DIST)
+total_plant_points = len(plant_points)
+
+def find_lookahead_point_from(path, pos, lookahead, start_seg, heading, max_seg_look=30):
+    px, py = pos; hx, hy = heading; n = len(path); candidates = []
+    end_seg = min(n - 1, start_seg + max_seg_look)
+    if start_seg >= n - 1: return np.array(path[-1]), n - 2, 1.0
+    for i in range(start_seg, end_seg):
+        x1, y1 = path[i]; x2, y2 = path[i + 1]; dx, dy = x2 - x1, y2 - y1; a = dx * dx + dy * dy
+        if a < 1e-12: continue
+        b = 2 * (dx * (x1 - px) + dy * (y1 - py)); c = (x1 - px) ** 2 + (y1 - py) ** 2 - lookahead ** 2
+        disc = b * b - 4 * a * c
+        if disc < 0: continue
+        sqrt_disc = math.sqrt(disc)
+        for t in [(-b - sqrt_disc) / (2 * a), (-b + sqrt_disc) / (2 * a)]:
+            if 0.0 <= t <= 1.0:
+                lx, ly = x1 + t * dx, y1 + t * dy
+                if (lx - px) * hx + (ly - py) * hy > 1e-9: candidates.append((i, t, np.array([lx, ly])))
+    if candidates:
+        i_best, t_best, p_best = min(candidates, key=lambda k: (k[0], k[1])); return p_best, i_best, t_best
+    try:
+        if start_seg < n - 1:
+            x1, y1 = path[start_seg]; x2, y2 = path[start_seg + 1]; dx, dy = x2 - x1, y2 - y1; seg_len2 = dx * dx + dy * dy
+            if seg_len2 < 1e-12: return find_lookahead_point_from(path, pos, lookahead, start_seg + 1, heading, max_seg_look)
+            seg_len = math.sqrt(seg_len2); t0 = ((px - x1) * dx + (py - y1) * dy) / seg_len2; t_tar = min(1.0, max(0.0, t0) + lookahead / seg_len)
+            vx, vy = x1 + t_tar * dx, y1 + t_tar * dy
+            if (vx - px) * hx + (vy - py) * hy <= 0.0: vx, vy = x1 + min(1.0, t_tar + 1e-3) * dx, y1 + min(1.0, t_tar + 1e-3) * dy
+            return np.array([vx, vy]), start_seg, t_tar
+    except: pass 
+    return np.array(path[-1]), n - 2, 1.0
+
+def pure_pursuit_steer_from(path, rear_pos, yaw, lookahead, wheelbase, max_steer_rad, start_seg):
+    global last_look_point
+    try:
+        heading = (math.cos(yaw), math.sin(yaw))
+        look_pt, seg_idx, seg_t = find_lookahead_point_from(path, rear_pos, lookahead, start_seg, heading)
+        last_look_point = look_pt; dx = look_pt[0] - rear_pos[0]; dy = look_pt[1] - rear_pos[1]
+        x_f = math.cos(yaw)*dx + math.sin(yaw)*dy; y_l = -math.sin(yaw)*dx + math.cos(yaw)*dy
+        if not (math.isfinite(x_f) and math.isfinite(y_l)): return 0.0, look_pt, seg_idx
+        if x_f <= 0.0:
+            look_pt, seg_idx, _ = find_lookahead_point_from(path, rear_pos, lookahead, min(start_seg+1, len(path)-2), heading)
+            last_look_point = look_pt; dx = look_pt[0] - rear_pos[0]; dy = look_pt[1] - rear_pos[1]
+            x_f = math.cos(yaw)*dx + math.sin(yaw)*dy; y_l = -math.sin(yaw)*dx + math.cos(yaw)*dy
+        if abs(x_f) < 1e-9 and abs(y_l) < 1e-9: return 0.0, look_pt, seg_idx
+        curvature = 2.0 * y_l / (lookahead**2); steer = math.atan(curvature * wheelbase)
+        return max(-max_steer_rad, min(max_steer_rad, steer)), look_pt, seg_idx
+    except: return 0.0, np.array([rear_pos[0], rear_pos[1]]), start_seg
+
+def map_steering_to_servo(steer_rad, max_steer_rad):
+    norm_steer = steer_rad / max_steer_rad if max_steer_rad != 0 else 0
+    if INVERT_STEER: norm_steer = -norm_steer
+    if norm_steer < 0: angle = SERVO_CENTER + (norm_steer * (SERVO_CENTER - SERVO_LEFT_LIMIT))
+    else: angle = SERVO_CENTER + (norm_steer * (SERVO_RIGHT_LIMIT - SERVO_CENTER))
+    return int(max(SERVO_LEFT_LIMIT, min(SERVO_RIGHT_LIMIT, angle)))
+
+rear_x, rear_y, yaw = float(path[0,0]), float(path[0,1]), 0.0
+steer = 0.0; prev_steer = 0.0; trajectory = [(rear_x, rear_y)]; path_done = False
+
+fig = plt.figure(figsize=(14, 8))
+ax = fig.add_axes([0.02, 0.05, 0.55, 0.9]); ax.set_aspect('equal')
+
+cam_img_display = ax.imshow(np.zeros((100, 100, 3), dtype=np.uint8), 
+                            extent=[0, AREA_W, 0, AREA_H], 
+                            origin='lower', zorder=0, alpha=0.8)
+
+def compute_plot_bounds():
+    all_x = [0.0, AREA_W] + list(path[:, 0])
+    all_y = [0.0, AREA_H] + list(path[:, 1])
+    return (min(all_x) - PLOT_FIT_MARGIN, max(all_x) + PLOT_FIT_MARGIN,
+            min(all_y) - PLOT_FIT_MARGIN, max(all_y) + PLOT_FIT_MARGIN)
+
+def apply_plot_bounds():
+    xl, xr, yl, yr = compute_plot_bounds()
+    ax.set_xlim(xl, xr); ax.set_ylim(yl, yr)
+
+def draw_grid_lines():
+    global grid_lines
+    for gl in grid_lines:
+        try: gl.remove()
+        except: pass
+    grid_lines.clear()
+    for gx in np.arange(0, AREA_W + 1.001, 1.0): grid_lines.append(ax.axvline(gx, color='lightgray', linewidth=0.6))
+    for gy in np.arange(0, AREA_H + 1.001, 1.0): grid_lines.append(ax.axhline(gy, color='lightgray', linewidth=0.6))
+
+apply_plot_bounds()
+ax.set_title("Seed Filler — U-TURN TEST (SIM + HW Encoder)")
+draw_grid_lines()
+
+area_rect = patches.Rectangle((0, 0), AREA_W, AREA_H, fill=False, linestyle='--', color='gray')
+ax.add_patch(area_rect)
+path_line, = ax.plot(path[:,0], path[:,1], 'c-', linewidth=2, label='Path', alpha=0.6)
+path_scatter = ax.scatter(path[:,0], path[:,1], c='cyan', s=30, alpha=0.8, zorder=3)
+
+if plant_points:
+    pp = np.array(plant_points)
+    plant_scatter = ax.scatter(pp[:,0], pp[:,1], c='orange', s=60, marker='o', alpha=0.6, label=f'Plant Points ({len(plant_points)})', zorder=4)
+else:
+    plant_scatter = ax.scatter([], [], c='orange', s=60, marker='o', alpha=0.6, zorder=4)
+
+planted_scatter = ax.scatter([], [], c='green', s=100, marker='v', alpha=0.9, label='Planted', zorder=5)
+current_target_marker, = ax.plot([], [], 'r*', markersize=18, label='Current Target', zorder=6)
+traj_line, = ax.plot([], [], 'b-', linewidth=2, label='Trajectory', alpha=0.7)
+look_circle = patches.Circle((rear_x, rear_y), LOOKAHEAD, fill=False, linestyle=':', edgecolor='blue', alpha=0.4); ax.add_patch(look_circle)
+look_dot, = ax.plot([], [], 'ro', ms=5, label='Lookahead'); heading_line, = ax.plot([], [], 'k-', lw=2)
+
+ideal_ghost_marker, = ax.plot([], [], 'c^', ms=16, alpha=0.0, zorder=7, label='Ideal Pos')
+drift_line, = ax.plot([], [], 'r--', lw=1.5, alpha=0.0, zorder=6, label='Drift')
+
+half_w = BODY_WID/2.0; rear_ext = 0.05 
+body_local = np.array([[-rear_ext, half_w], [BODY_LEN-rear_ext, half_w], [BODY_LEN-rear_ext, -half_w], [-rear_ext, -half_w]])
+body_patch = patches.Polygon(body_local, closed=True, facecolor='gray', alpha=0.7); ax.add_patch(body_patch)
+wheel_local = np.array([[-WHEEL_LEN/2, -WHEEL_WID/2], [WHEEL_LEN/2, -WHEEL_WID/2], [WHEEL_LEN/2, WHEEL_WID/2], [-WHEEL_LEN/2, WHEEL_WID/2]])
+wheel_centers = [np.array([0.0, half_w]), np.array([0.0, -half_w]), np.array([WHEELBASE, half_w]), np.array([WHEELBASE, -half_w])]
+wheel_patches = [patches.Polygon(wheel_local.copy(), closed=True, facecolor='black') for _ in wheel_centers]
+for wp in wheel_patches: ax.add_patch(wp)
+stepper_vis_line, = ax.plot([], [], 'm-', linewidth=4, alpha=0.8, zorder=8)
+stepper_vis_head = ax.scatter([], [], c='magenta', s=100, marker='s', alpha=0.8, zorder=9, edgecolors='white')
+ax.legend(loc='upper right', fontsize=7, ncol=2)
+
+status_label_text = fig.text(0.05, 0.97, "ROBOT STATUS: IDLE", fontsize=11, fontweight='bold', va='center', color='black')
+
+ax_ip = plt.axes([0.05, 0.92, 0.15, 0.03]); text_box = TextBox(ax_ip, 'IP: ', initial=ROBOT_IP)
+def submit_ip(text): global ROBOT_IP, http_session; ROBOT_IP = text; http_session = requests.Session()
+text_box.on_submit(submit_ip)
+ax_set_ip = plt.axes([0.22, 0.92, 0.08, 0.03]); btn_set_ip = Button(ax_set_ip, 'Set IP'); btn_set_ip.on_clicked(lambda event: submit_ip(text_box.text))
+
+ax_hw = plt.axes([0.05, 0.85, 0.10, 0.04]); btn_hw = Button(ax_hw, 'START HW', color='lightgreen', hovercolor='lime')
+ax_sim = plt.axes([0.16, 0.85, 0.10, 0.04]); btn_sim = Button(ax_sim, 'START SIM', color='lightblue', hovercolor='skyblue')
+ax_stop = plt.axes([0.27, 0.85, 0.08, 0.04]); btn_stop = Button(ax_stop, 'STOP', color='salmon', hovercolor='red')
+ax_reset = plt.axes([0.36, 0.85, 0.08, 0.04]); btn_reset = Button(ax_reset, 'RESET', color='orange', hovercolor='yellow')
+ax_log = plt.axes([0.45, 0.85, 0.08, 0.04]); btn_log = Button(ax_log, 'LOG: OFF', color='lightgray', hovercolor='white')
+
+ax_emergency = plt.axes([0.05, 0.79, 0.10, 0.04]); btn_emergency = Button(ax_emergency, 'E-STOP', color='red', hovercolor='darkred')
+ax_cam = plt.axes([0.16, 0.79, 0.12, 0.04]); btn_cam = Button(ax_cam, 'START CAM', color='plum', hovercolor='violet')
+
+ax_utest = plt.axes([0.29, 0.79, 0.12, 0.04])
+btn_utest = Button(ax_utest, 'U-TURN TEST', color='lightyellow', hovercolor='yellow')
+
+ax_aruco = plt.axes([0.42, 0.79, 0.12, 0.04])
+btn_aruco = Button(ax_aruco, 'RTT Aruco', color='white', hovercolor='lightgray')
+ax_aruco.set_visible(False)
+
+ax_cfg_w = plt.axes([0.05, 0.73, 0.07, 0.035]);  tb_w    = TextBox(ax_cfg_w, 'W:',    initial=str(AREA_W))
+ax_cfg_h = plt.axes([0.13, 0.73, 0.07, 0.035]);  tb_h    = TextBox(ax_cfg_h, 'H:',    initial=str(AREA_H))
+ax_cfg_r  = plt.axes([0.21, 0.73, 0.08, 0.035]); tb_r    = TextBox(ax_cfg_r, 'Rows:', initial=str(ROW_COUNT))
+ax_cfg_rs = plt.axes([0.30, 0.73, 0.07, 0.035]); tb_rs   = TextBox(ax_cfg_rs, 'RS:',   initial=str(ROW_SPACING))
+ax_cfg_ps = plt.axes([0.38, 0.73, 0.07, 0.035]); tb_ps   = TextBox(ax_cfg_ps, 'PS:',   initial=str(PLANT_SPACING))
+ax_cfg_noise = plt.axes([0.46, 0.73, 0.08, 0.035])
+tb_noise = TextBox(ax_cfg_noise, 'Noise:', initial='0.003')
+
+ax_apply  = plt.axes([0.55, 0.73, 0.08, 0.035]); btn_apply = Button(ax_apply, 'APPLY', color='lightyellow', hovercolor='yellow')
+fig.text(0.05, 0.768, "CONFIG  (W=Lebar H=Tinggi Rows=Baris RS=SpasiBaris PS=SpasiTanam Noise=EncNoise m/s)", fontsize=7, color='gray')
+
+def apply_config(event=None):
+    global AREA_W, AREA_H, ROW_COUNT, ROW_SPACING, PLANT_SPACING
+    global path, plant_points, total_plant_points, area_rect, utest_active
+    try:
+        AREA_W       = max(1.0,  float(tb_w.text))
+        AREA_H       = max(1.0,  float(tb_h.text))
+        ROW_COUNT    = max(1,    int(float(tb_r.text)))
+        ROW_SPACING  = max(0.1,  float(tb_rs.text))
+        PLANT_SPACING= max(0.05, float(tb_ps.text))
+    except Exception as e:
+        print(f"[CONFIG ERROR] {e}"); return
+    utest_active = False
+    path = generate_seed_filler_path()
+    plant_points = generate_plant_points_on_path(path, PLANT_SPACING, CORNER_AVOID_DIST)
+    total_plant_points = len(plant_points)
+    apply_plot_bounds(); draw_grid_lines()
+    area_rect.set_xy((0, 0)); area_rect.set_width(AREA_W); area_rect.set_height(AREA_H)
+    path_line.set_data(path[:,0], path[:,1]); path_scatter.set_offsets(path)
+    if plant_points: plant_scatter.set_offsets(np.array(plant_points))
+    else: plant_scatter.set_offsets(np.empty((0, 2)))
+    reset_sim(None); fig.canvas.draw_idle()
+
+btn_apply.on_clicked(apply_config)
+
+# ============================================================
+# start_hw: mendukung UTEST_HW saat utest_active=True
+# ============================================================
+def start_hw(event):
+    global is_running, USE_HARDWARE, robot_mode, session_data, sf_state, sim_elapsed
+    if not utest_active and sf_state == SF_DONE:
+        print("[HW] Path sudah selesai, klik RESET dulu.")
+        return
+    is_running = True
+    USE_HARDWARE = True
+    robot_mode = "UTEST_HW" if utest_active else "HW"
+    sim_elapsed = 0.0
+    sf_state = SF_MOVING
+    if record_session: session_data = [] 
+    start_hw_threads()
+    send_servo_command(SERVO_CENTER)
+    # send_stop_command() dihapus — langsung override hw_is_stopped=True lagi
+    print(f"[START] Mode: {robot_mode} | HW threads started")
+
+def start_sim(event):
+    global is_running, USE_HARDWARE, robot_mode, session_data, sf_state, sim_elapsed
+    if not utest_active and sf_state == SF_DONE:
+        print("[SIM] Path sudah selesai, klik RESET dulu.")
+        return
+    is_running = True
+    USE_HARDWARE = False
+    robot_mode = "UTEST_SIM" if utest_active else "SIM"
+    sim_elapsed = 0.0
+    sf_state = SF_MOVING
+    stop_hw_threads()
+    print(f"[START] Mode: {robot_mode}")
+
+# ============================================================
+# start_utest: HANYA siapkan jalur, TIDAK auto-start
+# User harus klik START HW atau START SIM setelah ini
+# ============================================================
+def start_utest(event):
+    global utest_active, utest_enc_noise, utest_max_drift, utest_drift_samples
+    global utest_drift_sum, utest_avg_drift
+    global ideal_x, ideal_y, ideal_yaw
+    global is_running, USE_HARDWARE, robot_mode, path, sf_state, sim_elapsed
+    global rear_x, rear_y, yaw, steer, prev_steer, trajectory, path_done
+    global current_seg, current_plant_idx, planted_points, plant_count
+    global stepper_pos, current_pwm, servo_deg, motor_dir, last_look_point
+    global hw_cmd_count, hw_fail_count, hw_stepper_down_sent, hw_stepper_up_sent
+    global utest_enc_v_left, utest_enc_v_right, utest_enc_v_linear, utest_enc_w_angular
+    global utest_hw_rpm1, utest_hw_rpm2, utest_hw_enc1, utest_hw_enc2, utest_drift
+
+    # Stop dulu jika sedang jalan
+    is_running = False
+    send_stop_command()
+    stop_hw_threads()
+
+    # Baca noise level
+    try:
+        utest_enc_noise = max(0.0, float(tb_noise.text))
+    except:
+        utest_enc_noise = 0.003
+
+    # Reset semua variabel test
+    utest_active = True
+    utest_max_drift = 0.0
+    utest_drift_samples = 0.0
+    utest_drift_sum = 0.0
+    utest_avg_drift = 0.0
+    utest_drift = 0.0
+    utest_enc_v_left = 0.0
+    utest_enc_v_right = 0.0
+    utest_enc_v_linear = 0.0
+    utest_enc_w_angular = 0.0
+    utest_hw_rpm1 = 0
+    utest_hw_rpm2 = 0
+    utest_hw_enc1 = 0
+    utest_hw_enc2 = 0
+
+    # Generate jalur test
+    path = generate_uturn_test_path()
+
+    # Update visual
+    path_line.set_data(path[:,0], path[:,1])
+    path_scatter.set_offsets(path)
+    plant_scatter.set_offsets(np.empty((0, 2)))
+    planted_scatter.set_offsets(np.empty((0, 2)))
+    current_target_marker.set_data([], [])
+    look_dot.set_data([], [])
+    traj_line.set_data([], [])
+    apply_plot_bounds()
+    draw_grid_lines()
+
+    # Reset posisi robot ke awal jalur
+    rear_x = float(path[0, 0])
+    rear_y = float(path[0, 1])
+    yaw = 0.0
+    ideal_x = rear_x
+    ideal_y = rear_y
+    ideal_yaw = 0.0
+    steer = 0.0
+    prev_steer = 0.0
+    trajectory = [(rear_x, rear_y)]
+    path_done = False
+    current_seg = 0
+    current_plant_idx = 0
+    planted_points = []
+    plant_count = 0
+    stepper_pos = 0.0
+    current_pwm = 0
+    servo_deg = SERVO_CENTER
+    motor_dir = 0
+    last_look_point = None
+    hw_cmd_count = 0
+    hw_fail_count = 0
+    hw_stepper_down_sent = False
+    hw_stepper_up_sent   = False
+    hw_benih_buka_sent   = False
+    hw_benih_dorong_sent = False
+    sim_elapsed = 0.0
+    sf_state = SF_IDLE
+    robot_mode = "UTEST_READY"  # siap, belum jalan
+    USE_HARDWARE = False
+
+    # Tampilkan ghost marker
+    ideal_ghost_marker.set_alpha(0.45)
+    drift_line.set_alpha(0.6)
+
+    uturn_r = ROW_SPACING / 2.0
+    req_steer = math.degrees(math.atan(WHEELBASE / uturn_r)) if uturn_r > 0.01 else 999
+    print(f"\n{'='*50}")
+    print(f"  U-TURN TEST MODE - SIAP")
+    print(f"  Path: {len(path)} WP | 5 baris, 4 U-turn")
+    print(f"  U-turn R: {uturn_r:.2f}m")
+    print(f"  Required steer: {req_steer:.1f}° / max {MAX_STEER_DEG}°")
+    print(f"  SIM noise: {utest_enc_noise} m/s")
+    print(f"  -> Klik START SIM atau START HW")
+    print(f"{'='*50}\n")
+
+def start_cam(event):
+    global is_running, USE_HARDWARE, robot_mode, sf_state, cap
+    USE_HARDWARE = False; robot_mode = "CAM"
+    stop_hw_threads()
+    if cap is None:
+        cap = cv2.VideoCapture(CAM_INDEX)
+        if not cap.isOpened():
+            print(f"[ERROR] Tidak bisa membuka Webcam USB di index: {CAM_INDEX}.")
+            cap = None; return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 60)
+    ax_aruco.set_visible(True); fig.canvas.draw_idle()
+
+def toggle_aruco(event):
+    global use_aruco_tracking
+    use_aruco_tracking = not use_aruco_tracking
+    if use_aruco_tracking:
+        btn_aruco.label.set_text('RTT Aruco: ON'); btn_aruco.color = 'lime'
+    else:
+        btn_aruco.label.set_text('RTT Aruco'); btn_aruco.color = 'white'
+
+def stop_cam(event=None):
+    global cap, robot_mode, is_running
+    if cap is not None: cap.release(); cap = None
+    if robot_mode == "CAM": robot_mode = "IDLE"; is_running = False
+    ax_aruco.set_visible(False); use_aruco_tracking = False
+    btn_aruco.label.set_text('RTT Aruco'); btn_aruco.color = 'white'
+    fig.canvas.draw_idle()
+
+def stop_sys(event):
+    global is_running, robot_mode, sf_state
+    is_running = False
+    robot_mode = "UTEST_READY" if utest_active else "IDLE"
+    sf_state = SF_IDLE
+    send_stop_command(); send_stepper_command(0)
+    stop_hw_threads()
+    if record_session: save_session_data()
+
+def reset_sim(event):
+    global is_running, rear_x, rear_y, yaw, steer, prev_steer, trajectory, path_done, robot_mode
+    global sf_state, current_plant_idx, planted_points, plant_count, stepper_pos, stepper_timer
+    global stop_timer, current_seg, current_pwm, servo_deg, motor_dir, last_look_point
+    global hw_cmd_count, hw_fail_count, sim_elapsed, hw_stepper_down_sent, hw_stepper_up_sent
+    global utest_active, ideal_x, ideal_y, ideal_yaw, utest_max_drift, utest_drift_samples
+    global utest_drift_sum, utest_avg_drift, utest_drift, utest_enc_v_left, utest_enc_v_right
+    global utest_enc_v_linear, utest_enc_w_angular
+
+    is_running = False; send_stop_command(); send_stepper_command(0)
+    stop_hw_threads()
+
+    # Keluar dari mode utest, restore path normal
+    utest_active = False
+    ideal_ghost_marker.set_alpha(0.0)
+    drift_line.set_alpha(0.0)
+
+    path = generate_seed_filler_path()
+    plant_points = generate_plant_points_on_path(path, PLANT_SPACING, CORNER_AVOID_DIST)
+    total_plant_points = len(plant_points)
+    path_line.set_data(path[:,0], path[:,1])
+    path_scatter.set_offsets(path)
+    if plant_points: plant_scatter.set_offsets(np.array(plant_points))
+    else: plant_scatter.set_offsets(np.empty((0, 2)))
+
+    if len(path) > 0: rear_x = float(path[0, 0]); rear_y = float(path[0, 1])
+    else: rear_x = 0.5; rear_y = 0.5
+    ideal_x = rear_x; ideal_y = rear_y; ideal_yaw = 0.0
+    yaw = 0.0; steer = 0.0; prev_steer = 0.0; path_done = False; current_seg = 0
+    trajectory = [(rear_x, rear_y)]; robot_mode = "IDLE"
+    sf_state = SF_IDLE; current_plant_idx = 0; planted_points = []; plant_count = 0
+    stepper_pos = 0.0; stepper_timer = 0.0; stop_timer = 0.0; current_pwm = 0
+    servo_deg = SERVO_CENTER; motor_dir = 0; last_look_point = None
+    hw_cmd_count = 0; hw_fail_count = 0; sim_elapsed = 0.0
+    hw_stepper_down_sent = False; hw_stepper_up_sent = False
+    hw_benih_buka_sent = False; hw_benih_dorong_sent = False
+    utest_max_drift = 0.0; utest_drift_samples = 0.0; utest_drift_sum = 0.0
+    utest_avg_drift = 0.0; utest_drift = 0.0
+    utest_enc_v_left = 0.0; utest_enc_v_right = 0.0
+    utest_enc_v_linear = 0.0; utest_enc_w_angular = 0.0
+    planted_scatter.set_offsets(np.empty((0, 2)))
+    current_target_marker.set_data([], []); look_dot.set_data([], [])
+    traj_line.set_data([], [])
+    trajectory = [(rear_x, rear_y)]
+    apply_plot_bounds(); draw_grid_lines()
+
+def toggle_log(event):
+    global record_session
+    record_session = not record_session
+    btn_log.label.set_text("LOG: ON" if record_session else "LOG: OFF"); 
+    btn_log.color = 'red' if record_session else 'lightgray'
+    if not record_session and len(session_data) > 0: save_session_data()
+
+def save_session_data():
+    global record_session, session_data
+    if not session_data:
+        record_session = False; btn_log.label.set_text('LOG: OFF'); btn_log.color = 'lightgray'; return
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    fname_csv = f"log_data_{timestamp}.csv"
+    try:
+        with open(fname_csv, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(["TimeStep", "Vel", "Enc1", "Enc2", "SteerDegCmd", "SteerDegMega", "Stepper", "State"])
+            for i, row in enumerate(session_data): w.writerow([i] + row)
+    except Exception as e: print(f"[ERROR] CSV: {e}")
+    fname_png = f"log_graph_{timestamp}.png"
+    try:
+        data = np.array(session_data); t = np.arange(len(data))
+        fig_log, axs = plt.subplots(4, 1, figsize=(12, 9))
+        fig_log.suptitle(f"Robot Log Data - {timestamp}", fontsize=14, fontweight='bold', y=0.98)
+        plt.subplots_adjust(hspace=0.55, top=0.93, bottom=0.06, left=0.10, right=0.95)
+        axs[0].plot(t, data[:, 0], 'b-', linewidth=1.5)
+        axs[0].set_ylabel("Velocity (m/s)", fontsize=9); axs[0].grid(True, linestyle='--', alpha=0.6)
+        ax_enc = axs[1]
+        ax_enc.plot(t, data[:, 1], 'b-', linewidth=1.5, label='Enc 1')
+        ax_enc.plot(t, data[:, 2], 'r-', linewidth=1.5, label='Enc 2')
+        ax_enc.set_ylabel("Encoder (Counts)", fontsize=9); ax_enc.grid(True, linestyle='--', alpha=0.6)
+        ax_enc.legend(loc='upper left', fontsize=8)
+        axs[2].plot(t, data[:, 3], 'g-', linewidth=1.5, label='Cmd (Python)')
+        axs[2].plot(t, data[:, 4], 'r--', linewidth=1.5, label='Mega confirms')
+        axs[2].set_ylabel("Steering (deg)", fontsize=9); axs[2].grid(True, linestyle='--', alpha=0.6)
+        axs[2].legend(loc='upper left', fontsize=8)
+        axs[3].plot(t, data[:, 5], 'm-', linewidth=1.5)
+        axs[3].set_ylabel("Stepper (Norm)", fontsize=9); axs[3].set_xlabel("Time Step", fontsize=9)
+        axs[3].grid(True, linestyle='--', alpha=0.6); axs[3].set_ylim(-0.1, 1.1)
+        fig_log.savefig(fname_png, dpi=150, facecolor='white')
+        plt.close(fig_log)
+    except Exception as e: print(f"[ERROR] PNG: {e}")
+    record_session = False
+    btn_log.label.set_text('LOG: OFF'); btn_log.color = 'lightgray'; session_data = []
+
+def on_emergency_stop(event):
+    global is_running; is_running = False
+    send_to_esp_force("STOP"); stop_hw_threads()
+    if record_session: save_session_data()
+
+btn_hw.on_clicked(start_hw); btn_sim.on_clicked(start_sim); btn_stop.on_clicked(stop_sys)
+btn_reset.on_clicked(reset_sim); btn_log.on_clicked(toggle_log)
+btn_emergency.on_clicked(on_emergency_stop)
+btn_cam.on_clicked(start_cam); btn_aruco.on_clicked(toggle_aruco)
+btn_utest.on_clicked(start_utest)
+
+term_ax = fig.add_axes([0.60, 0.58, 0.37, 0.36]); term_ax.axis('off')
+terminal_text = term_ax.text(0, 1.0, "", va='top', ha='left', fontsize=8.5, family='monospace', transform=term_ax.transAxes)
+
+ax_vel = fig.add_axes([0.60, 0.465, 0.37, 0.09]); ax_vel.set_title("Linear Velocity (m/s)", fontsize=9); ax_vel.grid(True, linestyle='--', alpha=0.6)
+ax_vel.set_xlim(0, HISTORY_LEN); ax_vel.set_xticklabels([]); ax_vel.tick_params(axis='both', which='major', labelsize=7)
+line_v, = ax_vel.plot([], [], 'b-', lw=1.5)
+
+ax_enc = fig.add_axes([0.60, 0.355, 0.37, 0.09]); ax_enc.set_title("Encoder Vel L/R (m/s)", fontsize=9); ax_enc.grid(True, linestyle='--', alpha=0.6)
+ax_enc.set_xlim(0, HISTORY_LEN); ax_enc.set_xticklabels([]); ax_enc.tick_params(axis='both', which='major', labelsize=7)
+line_enc1, = ax_enc.plot([], [], 'b-', lw=1.5, label='v Left')
+line_enc2, = ax_enc.plot([], [], 'r-', lw=1.5, label='v Right')
+ax_enc.legend(loc='upper left', fontsize=7)
+
+ax_steer = fig.add_axes([0.60, 0.245, 0.37, 0.09]); ax_steer.set_title("Steering Angle (deg)", fontsize=9); ax_steer.grid(True, linestyle='--', alpha=0.6)
+ax_steer.set_xlim(0, HISTORY_LEN); ax_steer.set_xticklabels([]); ax_steer.tick_params(axis='both', which='major', labelsize=7)
+line_s, = ax_steer.plot([], [], 'g-', lw=1.5)
+
+ax_step = fig.add_axes([0.60, 0.135, 0.37, 0.09]); ax_step.set_title("Drift from Ideal (m)", fontsize=9); ax_step.grid(True, linestyle='--', alpha=0.6)
+ax_step.set_xlim(0, HISTORY_LEN); ax_step.set_ylim(-0.01, 0.15); ax_step.set_xticklabels([]); ax_step.tick_params(axis='both', which='major', labelsize=7)
+line_step, = ax_step.plot([], [], 'r-', lw=1.5)
+history_drift = deque([0]*HISTORY_LEN, maxlen=HISTORY_LEN)
+
+max_steer = math.radians(MAX_STEER_DEG)
+
+def update_seed_filler(real_dt):
+    global sf_state, stepper_pos, stepper_timer, stop_timer, current_seg
+    global current_plant_idx, planted_points, plant_count, rear_x, rear_y, yaw
+    global is_running, path_done, sim_elapsed, hw_stepper_down_sent, hw_stepper_up_sent
+    global hw_benih_buka_sent, hw_benih_dorong_sent
+
+    if current_plant_idx >= total_plant_points or current_plant_idx >= len(plant_points):
+        sf_state = SF_DONE; path_done = True; is_running = False
+        send_stop_command(); send_stepper_command(0)
+        return 0.0, 0.0, False
+
+    tx, ty = plant_points[current_plant_idx]
+    dist = math.hypot(tx - rear_x, ty - rear_y)
+
+    if sf_state == SF_MOVING:
+        if dist < 0.6: sf_state = SF_APPROACHING
+        desired, look_pt, seg = pure_pursuit_steer_from(path, (rear_x, rear_y), yaw, LOOKAHEAD, WHEELBASE, max_steer, current_seg)
+        current_seg = max(current_seg, min(seg, current_seg + 1))
+        return V_BASE, desired, True
+    elif sf_state == SF_APPROACHING:
+        desired, look_pt, seg = pure_pursuit_steer_from(path, (rear_x, rear_y), yaw, LOOKAHEAD, WHEELBASE, max_steer, current_seg)
+        current_seg = max(current_seg, min(seg, current_seg + 1))
+        v_slow = V_BASE * max(0.2, dist / 0.6)
+        if dist < 0.12 and abs(steer) < math.radians(8.0):
+            sf_state = SF_STOPPING; stop_timer = 0
+            hw_stepper_down_sent = False
+            return 0.0, 0.0, True
+        return v_slow, desired, True
+    elif sf_state == SF_STOPPING:
+        stop_timer += real_dt
+        if USE_HARDWARE and not hw_stepper_down_sent:
+            send_stepper_command(STEPPER_MAX_STEPS)
+            hw_stepper_down_sent = True
+        if stop_timer > 0.2:
+            sf_state = SF_STEPPER_DOWN; stepper_timer = 0
+        return 0.0, 0.0, True
+    elif sf_state == SF_STEPPER_DOWN:
+        stepper_timer += real_dt
+        stepper_pos = min(1.0, stepper_timer / STEPPER_DOWN_TIME)
+        if stepper_timer >= STEPPER_DOWN_TIME:
+            stepper_pos = 1.0
+            sf_state = SF_BENIH_BUKA
+            stepper_timer = 0
+            hw_benih_buka_sent = False
+        return 0.0, 0.0, True
+
+    elif sf_state == SF_BENIH_BUKA:
+        stepper_timer += real_dt
+        if USE_HARDWARE and not hw_benih_buka_sent:
+            action_cmd_queue.put(f"BENIH,{BENIH_BUKA}")
+            hw_benih_buka_sent = True
+        if stepper_timer >= BENIH_BUKA_TIME:
+            sf_state = SF_BENIH_DORONG
+            stepper_timer = 0
+            hw_benih_dorong_sent = False
+        return 0.0, 0.0, True
+
+    elif sf_state == SF_BENIH_DORONG:
+        stepper_timer += real_dt
+        if USE_HARDWARE and not hw_benih_dorong_sent:
+            action_cmd_queue.put(f"BENIH,{BENIH_TUTUP}")
+            hw_benih_dorong_sent = True
+        if stepper_timer >= BENIH_DORONG_TIME:
+            sf_state = SF_HOLDING
+            stepper_timer = 0
+            hw_stepper_up_sent = False
+        return 0.0, 0.0, True
+
+    elif sf_state == SF_HOLDING:
+        stepper_timer += real_dt
+        if USE_HARDWARE and not hw_stepper_up_sent:
+            send_stepper_command(0)
+            hw_stepper_up_sent = True
+        if stepper_timer >= STEPPER_HOLD_TIME:
+            sf_state = SF_STEPPER_UP; stepper_timer = 0
+        return 0.0, 0.0, True
+    elif sf_state == SF_STEPPER_UP:
+        stepper_timer += real_dt
+        stepper_pos = max(0.0, 1.0 - stepper_timer / STEPPER_UP_TIME)
+        if stepper_timer >= STEPPER_UP_TIME:
+            stepper_pos = 0.0; sf_state = SF_WAITING; stepper_timer = 0
+        return 0.0, 0.0, True
+    elif sf_state == SF_WAITING:
+        stepper_timer += real_dt
+        if stepper_timer >= STEPPER_WAIT_TIME:
+            planted_points.append((tx, ty))
+            plant_count = len(planted_points)
+            current_plant_idx += 1
+            sf_state = SF_MOVING
+        return 0.0, 0.0, True
+    return 0.0, 0.0, False
+
+def update_utest(real_dt):
+    global current_seg, path_done, is_running, sf_state
+    global utest_max_drift, utest_drift_samples, utest_drift_sum, utest_avg_drift, utest_drift
+
+    last_pt = path[-1]
+    dist_to_end = math.hypot(rear_x - last_pt[0], rear_y - last_pt[1])
+    if current_seg >= len(path) - 3 and dist_to_end < 0.3:
+        path_done = True; is_running = False; sf_state = SF_DONE
+        send_stop_command()
+        print(f"[UTEST] SELESAI! MaxDrift:{utest_max_drift:.4f}m AvgDrift:{utest_avg_drift:.4f}m Waktu:{sim_elapsed:.1f}s")
+        return 0.0, 0.0, False
+
+    sf_state = SF_MOVING
+    desired, look_pt, seg = pure_pursuit_steer_from(path, (rear_x, rear_y), yaw, LOOKAHEAD, WHEELBASE, max_steer, current_seg)
+    current_seg = max(current_seg, min(seg, current_seg + 1))
+
+    utest_drift = math.hypot(rear_x - ideal_x, rear_y - ideal_y)
+    if utest_drift > utest_max_drift:
+        utest_max_drift = utest_drift
+    utest_drift_samples += 1
+    utest_drift_sum += utest_drift
+    utest_avg_drift = utest_drift_sum / utest_drift_samples if utest_drift_samples > 0 else 0
+
+    return V_BASE, desired, True
+
+def update(frame):
+    global rear_x, rear_y, yaw, steer, prev_steer, path_done, current_seg
+    global stepper_pos, current_pwm, servo_deg, motor_dir, trajectory
+    global last_update_time, fps_smooth, loop_count, fps_timer, sim_elapsed
+    global ideal_x, ideal_y, ideal_yaw, utest_drift
+    global utest_enc_v_left, utest_enc_v_right, utest_enc_v_linear, utest_enc_w_angular
+    global utest_hw_rpm1, utest_hw_rpm2, utest_hw_enc1, utest_hw_enc2
+
+    now = time.perf_counter()
+    real_dt = now - last_update_time
+    if real_dt <= 0: real_dt = DT
+    if real_dt > 0.1: real_dt = 0.1
+    last_update_time = now
+
+    loop_count += 1
+    if now - fps_timer >= 0.5:
+        fps_smooth = loop_count / (now - fps_timer)
+        loop_count = 0; fps_timer = now
+
+    if USE_HARDWARE: update_hw_rates()
+
+    frame_cam = None
+    if robot_mode == "CAM" and cap is not None and cap.isOpened():
+        ret, f = cap.read()
+        if ret: frame_cam = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+
+    if frame_cam is not None:
+        if use_aruco_tracking:
+            frame_gray = cv2.cvtColor(frame_cam, cv2.COLOR_RGB2GRAY)
+            corners, ids = detect_aruco(frame_gray)
+            if ids is not None:
+                cv2.aruco.drawDetectedMarkers(frame_cam, corners, ids)
+                for i in range(len(ids)):
+                    if ids[i][0] == ARUCO_ID:
+                        c = corners[i][0]
+                        cx_px = int(np.mean(c[:, 0])); cy_px = int(np.mean(c[:, 1]))
+                        h, w = frame_cam.shape[:2]
+                        x_min_ext, x_max_ext = -PLOT_FIT_MARGIN, AREA_W + PLOT_FIT_MARGIN
+                        y_min_ext, y_max_ext = -PLOT_FIT_MARGIN, AREA_H + PLOT_FIT_MARGIN
+                        map_x = x_min_ext + (cx_px / w) * (x_max_ext - x_min_ext)
+                        map_y = y_min_ext + (1.0 - (cy_px / h)) * (y_max_ext - y_min_ext)
+                        tl_x, tl_y = c[0]; tr_x, tr_y = c[1]
+                        map_yaw = math.atan2(-(tr_y - tl_y), tr_x - tl_x)
+                        rear_x = map_x; rear_y = map_y; yaw = map_yaw
+                        break
+        cam_img_display.set_data(frame_cam)
+        cam_img_display.set_extent([-PLOT_FIT_MARGIN, AREA_W + PLOT_FIT_MARGIN, -PLOT_FIT_MARGIN, AREA_H + PLOT_FIT_MARGIN])
+        cam_img_display.set_alpha(0.9)
+    else:
+        cam_img_display.set_data(np.zeros((100, 100, 3), dtype=np.uint8))
+
+    fps_txt = f"{fps_smooth:.0f} FPS"
+
+    # Status label
+    if utest_active:
+        if robot_mode == "UTEST_READY":
+            body_patch.set_facecolor('lightyellow')
+            status_label_text.set_text(f"U-TURN TEST: SIAP → Klik START SIM atau START HW | {fps_txt}")
+            status_label_text.set_color('goldenrod')
+        elif sf_state == SF_DONE:
+            body_patch.set_facecolor('green')
+            status_label_text.set_text(f"UTEST SELESAI! Max:{utest_max_drift:.3f}m Avg:{utest_avg_drift:.3f}m ({sim_elapsed:.1f}s) | {fps_txt}")
+            status_label_text.set_color('green')
+        else:
+            body_patch.set_facecolor('yellow')
+            hw_tag = "HW" if USE_HARDWARE else "SIM"
+            status_label_text.set_text(f"U-TURN TEST [{hw_tag}] Drift:{utest_drift:.3f}m Max:{utest_max_drift:.3f}m | {fps_txt}")
+            status_label_text.set_color('darkgoldenrod')
+    elif sf_state == SF_DONE:
+        body_patch.set_facecolor('green')
+        status_label_text.set_text(f"FILLER SELESAI! {plant_count}/{total_plant_points} ({sim_elapsed:.1f}s) | {fps_txt}")
+        status_label_text.set_color('green')
+    elif sf_state in [SF_STEPPER_DOWN, SF_HOLDING, SF_STEPPER_UP, SF_BENIH_BUKA, SF_BENIH_DORONG]:
+        body_patch.set_facecolor('magenta'); status_label_text.set_text(f"SEED FILLER: {sf_state} | {fps_txt}"); status_label_text.set_color('darkviolet')
+    elif sf_state in [SF_STOPPING, SF_WAITING, SF_APPROACHING]:
+        body_patch.set_facecolor('orange'); status_label_text.set_text(f"SEED FILLER: {sf_state} | {fps_txt}"); status_label_text.set_color('darkorange')
+    elif sf_state == SF_MOVING:
+        body_patch.set_facecolor('gold'); status_label_text.set_text(f"SEED FILLER: {sf_state} | {fps_txt}"); status_label_text.set_color('goldenrod')
+    elif robot_mode == "CAM":
+        body_patch.set_facecolor('violet'); status_label_text.set_text(f"ROBOT STATUS: CAM MODE | {fps_txt}"); status_label_text.set_color('darkviolet')
+    elif robot_mode == "SIM":
+        body_patch.set_facecolor('dodgerblue'); status_label_text.set_text(f"ROBOT STATUS: SIM | {fps_txt}"); status_label_text.set_color('dodgerblue')
+    elif robot_mode == "HW":
+        if robot_online:
+            body_patch.set_facecolor('lime'); status_label_text.set_text(f"ROBOT STATUS: HW ONLINE | {fps_txt}"); status_label_text.set_color('green')
+        else:
+            body_patch.set_facecolor('red'); status_label_text.set_text(f"ROBOT STATUS: HW OFFLINE | {fps_txt}"); status_label_text.set_color('red')
+    else:
+        body_patch.set_facecolor('gray'); status_label_text.set_text("ROBOT STATUS: IDLE"); status_label_text.set_color('black')
+
+    # Terminal saat idle/ready
+    if not is_running:
+        uturn_r = ROW_SPACING / 2.0
+        req_steer = math.degrees(math.atan(WHEELBASE / uturn_r)) if uturn_r > 0.01 else 999
+        if utest_active:
+            terminal_text.set_text(
+                "═══════ U-TURN TEST ═══════\n"
+                "Jalur: 5 baris, 4 U-turn\n"
+                f"Path WP: {len(path)}\n"
+                f"U-turn R: {uturn_r:.2f}m\n"
+                f"Req steer: {req_steer:.1f}° / {MAX_STEER_DEG}°\n"
+                f"SIM noise: {utest_enc_noise} m/s\n\n"
+                "── CARA PAKAI ──\n"
+                "START SIM = test simulasi encoder\n"
+                "  (encoder digauss + noise)\n"
+                "START HW  = test robot fisik\n"
+                "  (posisi dari RPM encoder asli)\n\n"
+                "Cyan ▲ = posisi ideal\n"
+                "Merah ─ = drift (selisih)\n"
+                "Grafik bawah = drift real-time"
+            )
+        else:
+            terminal_text.set_text(
+                "SYSTEM STOPPED\n\n"
+                "START SIM  -> simulasi lokal\n"
+                "START HW   -> gerakkan fisik\n"
+                "U-TURN TEST-> test U-turn\n"
+                f"Plant: {total_plant_points} | WP: {len(path)}\n\n"
+                f"U-turn R: {uturn_r:.2f}m\n"
+                f"Steer Rate: {math.degrees(MAX_STEER_RATE):.0f}°/s"
+            )
+        return (cam_img_display, traj_line, look_circle, look_dot, heading_line, body_patch, 
+                *wheel_patches, terminal_text, line_v, line_enc1, line_enc2, line_s, line_step, 
+                plant_scatter, planted_scatter, current_target_marker, stepper_vis_line, stepper_vis_head,
+                ideal_ghost_marker, drift_line)
+
+    if path_done:
+        send_stop_command()
+        if record_session: save_session_data()
+        return (cam_img_display, traj_line, look_circle, look_dot, heading_line, body_patch, 
+                *wheel_patches, terminal_text, line_v, line_enc1, line_enc2, line_s, line_step, 
+                plant_scatter, planted_scatter, current_target_marker, stepper_vis_line, stepper_vis_head,
+                ideal_ghost_marker, drift_line)
+
+    try:
+        # Ambil data odometry (HW: dari ESP, SIM: semua 0)
+        real_v, real_w, real_servo, real_stepper, odometry_valid, real_enc1, real_enc2, real_rpm1, real_rpm2 = get_odometry()
+
+        # Pilih update function
+        if utest_active:
+            v_cmd, steer_cmd, motor_on = update_utest(real_dt)
+        else:
+            v_cmd, steer_cmd, motor_on = update_seed_filler(real_dt)
+
+        if motor_on or sf_state in [SF_STOPPING, SF_STEPPER_DOWN, SF_HOLDING, SF_STEPPER_UP, SF_WAITING]:
+            sim_elapsed += real_dt
+
+        # Steering ramp
+        max_ds = MAX_STEER_RATE * real_dt
+        ds = steer_cmd - prev_steer
+        if ds > max_ds: steer_cmd = prev_steer + max_ds
+        elif ds < -max_ds: steer_cmd = prev_steer - max_ds
+        prev_steer = steer_cmd; steer = steer_cmd
+        
+        servo_deg = map_steering_to_servo(steer, max_steer)
+        if USE_HARDWARE and abs(steer) > math.radians(5):
+            print(f"[STEER] steer={math.degrees(steer):.1f}° servo_deg={servo_deg} hw_target={hw_target_servo}")
+        
+        steer_norm = abs(steer) / max_steer if max_steer != 0 else 0
+        steer_factor = max(0.02, 1.0 - (steer_norm ** 1.2) * 0.98)
+        
+        current_pwm = int(MOTOR_PWM_MAX * steer_factor * (v_cmd / V_BASE)) if V_BASE != 0 else 0
+        current_pwm = max(0, min(MOTOR_PWM_MAX, current_pwm)); motor_dir = 1
+
+        v_actual = v_cmd * steer_factor
+        cmd_v_display = v_actual
+        
+        # ============================================================
+        # POSISI DARI ENCODER
+        # ============================================================
+        if not use_aruco_tracking and motor_on and v_actual > 0.001:
+            if utest_active:
+                # --- 1. Selalu update posisi IDEAL (kinematik sempurna) ---
+                omega_ideal = (v_actual / WHEELBASE) * math.tan(steer) if WHEELBASE != 0 else 0
+                if not (math.isnan(omega_ideal) or math.isinf(omega_ideal)):
+                    ideal_x += v_actual * math.cos(ideal_yaw) * real_dt
+                    ideal_y += v_actual * math.sin(ideal_yaw) * real_dt
+                    ideal_yaw += omega_ideal * real_dt
+                    while ideal_yaw > math.pi: ideal_yaw -= 2*math.pi
+                    while ideal_yaw < -math.pi: ideal_yaw += 2*math.pi
+
+                if USE_HARDWARE:
+                    # ============================================
+                    # HW: Posisi DARI ENCODER ASLI (rpm1, rpm2)
+                    # ============================================
+                    utest_hw_rpm1 = real_rpm1
+                    utest_hw_rpm2 = real_rpm2
+                    utest_hw_enc1 = real_enc1
+                    utest_hw_enc2 = real_enc2
+
+                    # Hitung v_left/v_right dari RPM asli
+                    utest_enc_v_left = (real_rpm1 * 2 * math.pi * WHEEL_RADIUS) / (60 * GEAR_RATIO)
+                    utest_enc_v_right = (real_rpm2 * 2 * math.pi * WHEEL_RADIUS) / (60 * GEAR_RATIO)
+
+                    # Odometry dari encoder
+                    utest_enc_v_linear = (utest_enc_v_left + utest_enc_v_right) / 2.0
+                    utest_enc_w_angular = (utest_enc_v_right - utest_enc_v_left) / WHEELBASE
+
+                    # Update posisi AKTUAL dari encoder
+                    if not (math.isnan(utest_enc_w_angular) or math.isinf(utest_enc_w_angular)):
+                        rear_x += utest_enc_v_linear * math.cos(yaw) * real_dt
+                        rear_y += utest_enc_v_linear * math.sin(yaw) * real_dt
+                        yaw += utest_enc_w_angular * real_dt
+                        while yaw > math.pi: yaw -= 2*math.pi
+                        while yaw < -math.pi: yaw += 2*math.pi
+                else:
+                    # ============================================
+                    # SIM: Simulasi pembacaan encoder + noise
+                    # ============================================
+                    tan_steer = math.tan(steer) if abs(steer) < math.radians(89) else math.copysign(100, steer)
+                    
+                    if abs(tan_steer) > 0.001:
+                        R = WHEELBASE / tan_steer
+                        abs_R = abs(R)
+                        if abs_R > 0.001:
+                            v_inner = v_actual * abs(abs_R - WHEELBASE / 2.0) / abs_R
+                            v_outer = v_actual * abs(abs_R + WHEELBASE / 2.0) / abs_R
+                        else:
+                            v_inner = v_outer = v_actual
+                    else:
+                        v_inner = v_outer = v_actual
+
+                    if steer > 0:
+                        raw_v_left = v_inner
+                        raw_v_right = v_outer
+                    else:
+                        raw_v_left = v_outer
+                        raw_v_right = v_inner
+
+                    noise_l = np.random.normal(0, utest_enc_noise)
+                    noise_r = np.random.normal(0, utest_enc_noise)
+                    utest_enc_v_left = raw_v_left + noise_l
+                    utest_enc_v_right = raw_v_right + noise_r
+
+                    utest_enc_v_linear = (utest_enc_v_left + utest_enc_v_right) / 2.0
+                    utest_enc_w_angular = (utest_enc_v_right - utest_enc_v_left) / WHEELBASE
+
+                    if not (math.isnan(utest_enc_w_angular) or math.isinf(utest_enc_w_angular)):
+                        rear_x += utest_enc_v_linear * math.cos(yaw) * real_dt
+                        rear_y += utest_enc_v_linear * math.sin(yaw) * real_dt
+                        yaw += utest_enc_w_angular * real_dt
+                        while yaw > math.pi: yaw -= 2*math.pi
+                        while yaw < -math.pi: yaw += 2*math.pi
+            else:
+                # --- MODE NORMAL (bukan utest): kinematik ideal ---
+                omega = (v_actual / WHEELBASE) * math.tan(steer) if WHEELBASE != 0 else 0
+                if not (math.isnan(omega) or math.isinf(omega)):
+                    rear_x += v_actual * math.cos(yaw) * real_dt
+                    rear_y += v_actual * math.sin(yaw) * real_dt
+                    yaw += omega * real_dt
+                    while yaw > math.pi: yaw -= 2*math.pi
+                    while yaw < -math.pi: yaw += 2*math.pi
+        
+        # Kirim command ke HW
+        if USE_HARDWARE:
+            # Servo selalu dikirim — terpisah dari kondisi motor
+            send_servo_command(servo_deg)
+            if motor_on and v_cmd > 0.01:
+                send_motor_command(current_pwm, motor_dir)
+            else:
+                send_stop_command()
+
+        # History untuk grafik
+        history_v.append(cmd_v_display)
+        if utest_active:
+            history_enc1.append(utest_enc_v_left)
+            history_enc2.append(utest_enc_v_right)
+            history_drift.append(utest_drift)
+        else:
+            history_enc1.append(real_enc1)
+            history_enc2.append(real_enc2)
+            history_drift.append(0)
+        history_servo.append(servo_deg - SERVO_CENTER)
+        history_stepper.append(stepper_pos)
+
+        if is_running and record_session:
+            session_data.append([cmd_v_display, utest_enc_v_left if utest_active else real_enc1,
+                                utest_enc_v_right if utest_active else real_enc2,
+                                servo_deg - SERVO_CENTER, real_servo - SERVO_CENTER, stepper_pos, sf_state])
+
+        # Update grafik
+        x_data = np.arange(len(history_v))
+        line_v.set_data(x_data, history_v); ax_vel.set_ylim(min(history_v)-0.1, max(max(history_v)+0.1, 0.5))
+        line_enc1.set_data(x_data, history_enc1); line_enc2.set_data(x_data, history_enc2)
+        if utest_active:
+            all_enc = list(history_enc1) + list(history_enc2)
+            min_e = min(all_enc); max_e = max(all_enc)
+            pad = max(0.05, (max_e - min_e) * 0.1)
+            ax_enc.set_ylim(min_e - pad, max_e + pad)
+            ax_enc.set_title("Encoder Vel L/R (m/s)", fontsize=9)
+        else:
+            min_enc = min(min(history_enc1), min(history_enc2)); max_enc = max(max(history_enc1), max(history_enc2))
+            pad = max(10, (max_enc - min_enc) * 0.1); ax_enc.set_ylim(min_enc - pad, max_enc + pad)
+            ax_enc.set_title("Encoder Data (Raw Counts)", fontsize=9)
+        line_s.set_data(x_data, history_servo); ax_steer.set_ylim(min(history_servo)-10, max(max(history_servo)+10, 10))
+
+        if utest_active:
+            line_step.set_data(x_data, history_drift)
+            max_d = max(max(history_drift), 0.02)
+            ax_step.set_ylim(-0.005, max_d * 1.3)
+            ax_step.set_title("Drift from Ideal (m)", fontsize=9)
+        else:
+            line_step.set_data(x_data, history_stepper)
+            ax_step.set_ylim(-0.1, 1.1)
+            ax_step.set_title("Stepper Pos (0=Up 1=Down)", fontsize=9)
+
+        # Update trajectory & markers
+        trajectory.append((rear_x, rear_y))
+        if len(trajectory) > MAX_TRAJ_POINTS: trajectory = trajectory[-MAX_TRAJ_POINTS:]
+        if not utest_active:
+            if planted_points: planted_scatter.set_offsets(np.array(planted_points))
+            if current_plant_idx < total_plant_points and current_plant_idx < len(plant_points):
+                tx, ty = plant_points[current_plant_idx]; current_target_marker.set_data([tx], [ty])
+            else: current_target_marker.set_data([], [])
+        
+        if last_look_point is not None: look_dot.set_data([last_look_point[0]], [last_look_point[1]])
+        else: look_dot.set_data([], [])
+        
+        sb_x = rear_x + BODY_LEN*0.6*math.cos(yaw); sb_y = rear_y + BODY_LEN*0.6*math.sin(yaw)
+        ext = 0.4 * stepper_pos; st_x = sb_x - ext*math.sin(yaw); st_y = sb_y + ext*math.cos(yaw)
+        stepper_vis_line.set_data([sb_x, st_x], [sb_y, st_y]); stepper_vis_head.set_offsets([[st_x, st_y]])
+
+        tr = np.array(trajectory); traj_line.set_data(tr[:,0], tr[:,1]); look_circle.center = (rear_x, rear_y)
+        hx = rear_x + 0.2 * math.cos(yaw); hy = rear_y + 0.2 * math.sin(yaw)
+        heading_line.set_data([rear_x, hx], [rear_y, hy])
+        t_body = transforms.Affine2D().rotate(yaw).translate(rear_x, rear_y)
+        body_patch.set_transform(t_body + ax.transData)
+        for idx, wpatch in enumerate(wheel_patches):
+            center = wheel_centers[idx]
+            cx = rear_x + math.cos(yaw)*center[0] - math.sin(yaw)*center[1]
+            cy = rear_y + math.sin(yaw)*center[0] + math.cos(yaw)*center[1]
+            rot = yaw if idx < 2 else yaw + steer
+            R = np.array([[math.cos(rot), -math.sin(rot)], [math.sin(rot), math.cos(rot)]])
+            wpatch.set_xy((wheel_local @ R.T) + np.array([cx, cy]))
+
+        # Ghost & drift
+        if utest_active:
+            ideal_ghost_marker.set_data([ideal_x], [ideal_y])
+            drift_line.set_data([ideal_x, rear_x], [ideal_y, rear_y])
+            if utest_drift > 0.1:
+                drift_line.set_color('red'); drift_line.set_linewidth(2.5)
+            elif utest_drift > 0.05:
+                drift_line.set_color('orange'); drift_line.set_linewidth(2.0)
+            else:
+                drift_line.set_color('green'); drift_line.set_linewidth(1.5)
+        else:
+            ideal_ghost_marker.set_data([], [])
+            drift_line.set_data([], [])
+
+        # ============================================================
+        # TERMINAL
+        # ============================================================
+        if utest_active:
+            uturn_r = ROW_SPACING / 2.0
+            req_steer_deg = math.degrees(math.atan(WHEELBASE / uturn_r)) if uturn_r > 0.01 else 999
+
+            if USE_HARDWARE:
+                enc_str = (
+                    f"[ENCODER HW - REAL DATA]\n"
+                    f" RPM_L: {utest_hw_rpm1:4d} | RPM_R: {utest_hw_rpm2:4d}\n"
+                    f" ENC_L: {utest_hw_enc1:6d} | ENC_R: {utest_hw_enc2:6d}\n"
+                    f" v_L:   {utest_enc_v_left:+.4f} m/s\n"
+                    f" v_R:   {utest_enc_v_right:+.4f} m/s\n"
+                    f" v_lin: {utest_enc_v_linear:+.4f} m/s\n"
+                    f" ω:     {math.degrees(utest_enc_w_angular):+6.2f} °/s\n"
+                )
+                hw_info = (
+                    f"{'─'*38}\n"
+                    f"[HW LINK] {'ONLINE' if robot_online else 'OFFLINE'}\n"
+                    f" Snd:{hw_send_rate:.0f}/s Rd:{hw_read_rate:.0f}/s\n"
+                    f" OK:{hw_cmd_count} ERR:{hw_fail_count}\n"
+                    f" Servo out: {servo_deg}° | Mega confirms: {real_servo}°\n"
+                    f" Motor out: PWM={current_pwm} Dir={motor_dir}\n"
+                )
+            else:
+                enc_str = (
+                    f"[ENCODER SIM + noise σ={utest_enc_noise}]\n"
+                    f" v_L:   {utest_enc_v_left:+.4f} m/s\n"
+                    f" v_R:   {utest_enc_v_right:+.4f} m/s\n"
+                    f" v_lin: {utest_enc_v_linear:+.4f} m/s\n"
+                    f" ω:     {math.degrees(utest_enc_w_angular):+6.2f} °/s\n"
+                )
+                hw_info = ""
+
+            terminal_str = (
+                f"═══ U-TURN TEST [{('HW' if USE_HARDWARE else 'SIM')}] ═══\n"
+                f"{sf_state} | {fps_smooth:.0f}FPS dt:{real_dt*1000:.1f}ms\n"
+                f"{'─'*38}\n"
+                f"{enc_str}"
+                f"{'─'*38}\n"
+                f"[IDEAL vs AKTUAL]\n"
+                f" Ideal: ({ideal_x:.3f}, {ideal_y:.3f}) {math.degrees(ideal_yaw):+6.1f}°\n"
+                f" Aktif: ({rear_x:.3f}, {rear_y:.3f}) {math.degrees(yaw):+6.1f}°\n"
+                f"{'─'*38}\n"
+                f"[DRIFT] now:{utest_drift:.4f}m\n"
+                f"        max:{utest_max_drift:.4f}m\n"
+                f"        avg:{utest_avg_drift:.4f}m\n"
+                f"{hw_info}"
+                f"{'─'*38}\n"
+                f"Seg:{current_seg}/{len(path)-1}\n"
+                f"Steer:{math.degrees(steer):+.1f}° Req:{req_steer_deg:.1f}°\n"
+                f"Waktu:{sim_elapsed:.1f}s"
+            )
+        elif USE_HARDWARE:
+            q_action = action_cmd_queue.qsize()
+            terminal_str = (
+                f"MODE: HW | {sf_state}\n"
+                f"Loop: {fps_smooth:.0f} FPS | dt: {real_dt*1000:.1f}ms\n"
+                f"{'─'*38}\n"
+                f"[HARDWARE OUT] @ {HW_STATE_HZ}Hz\n"
+                f" Servo: {servo_deg}° -> Mega confirms: {real_servo}° | PWM: {current_pwm}\n"
+                f"{'─'*38}\n"
+                f"[QUEUES] Action(Step):{q_action}\n"
+                f"[THREAD] Snd:{hw_send_rate:.0f}/s Rd:{hw_read_rate:.0f}/s\n"
+                f"[ESP] {'ON' if robot_online else 'OFF'} OK:{hw_cmd_count} ERR:{hw_fail_count}\n"
+                f"{'─'*38}\n"
+                f"[FILLER] {plant_count}/{total_plant_points}\n"
+                f"Waktu: {sim_elapsed:.1f}s\n"
+                f"Pos: ({rear_x:.2f},{rear_y:.2f}) Yaw:{math.degrees(yaw):.1f}°"
+            )
+        else:
+            terminal_str = (
+                f"MODE: SIM | {sf_state}\n"
+                f"Loop: {fps_smooth:.0f} FPS | dt: {real_dt*1000:.1f}ms\n"
+                f"{'─'*38}\n"
+                f"AREA: {AREA_W}x{AREA_H} | Rows: {ROW_COUNT}\n"
+                f"Path WP: {len(path)} | Plant: {total_plant_points}\n"
+                f"U-turn R: {ROW_SPACING/2:.2f}m | Arc: {UTURN_ARC_POINTS}pts\n"
+                f"{'─'*38}\n"
+                f"[FILLER] {plant_count}/{total_plant_points}\n"
+                f"Waktu: {sim_elapsed:.1f}s\n"
+                f"{'─'*38}\n"
+                f"Pos: ({rear_x:.2f},{rear_y:.2f})\n"
+                f"Yaw: {math.degrees(yaw):.1f}° | Steer: {math.degrees(steer):.1f}°\n"
+                f"Seg: {current_seg}/{len(path)-1} | PWM: {current_pwm}"
+            )
+        terminal_text.set_text(terminal_str)
+
+    except Exception as e: 
+        print(f"ERROR: {e}")
+        import traceback; traceback.print_exc()
+    
+    return (cam_img_display, traj_line, look_circle, look_dot, heading_line, body_patch, 
+            *wheel_patches, terminal_text, line_v, line_enc1, line_enc2, line_s, line_step, 
+            plant_scatter, planted_scatter, current_target_marker, stepper_vis_line, stepper_vis_head,
+            ideal_ghost_marker, drift_line)
+
+def on_close(event):
+    stop_hw_threads()
+    if cap is not None: cap.release()
+
+fig.canvas.mpl_connect('close_event', on_close)
+
+ani = animation.FuncAnimation(fig, update, frames=None, interval=0, blit=False, cache_frame_data=False)
+plt.show()

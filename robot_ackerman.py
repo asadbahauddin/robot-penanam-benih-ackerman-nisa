@@ -866,7 +866,8 @@ def save_session_data():
     try:
         with open(fname_csv, 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(["TimeStep", "Vel", "Enc1", "Enc2", "SteerDegCmd", "SteerDegMega", "Stepper", "State"])
+            w.writerow(["TimeStep", "Vel", "Enc1", "Enc2", "SteerDegCmd", "SteerDegMega", "Stepper", "State",
+                        "X", "Y", "YawDeg", "CurrentSeg", "UturnActive", "UturnDir"])
             for i, row in enumerate(session_data): w.writerow([i] + row)
     except Exception as e: print(f"[ERROR] CSV: {e}")
     fname_png = f"log_graph_{timestamp}.png"
@@ -1210,6 +1211,9 @@ def update(frame):
             uturn_direction = 'R' if steer_cmd > 0 else 'L'
             uturn_start_time = sim_elapsed
             uturn_zone_lo, uturn_zone_hi = next((lo, hi) for (lo, hi) in uturn_ranges if lo <= current_seg <= hi)
+            print(f"[UTURN ENGAGE] dir={uturn_direction} current_seg={current_seg} zone=({uturn_zone_lo},{uturn_zone_hi}) "
+                  f"pos_sebelum=({rear_x:.3f},{rear_y:.3f}) path[lo]=({path[uturn_zone_lo][0]:.3f},{path[uturn_zone_lo][1]:.3f}) "
+                  f"t={sim_elapsed:.1f}s")
         if uturn_active:
             uturn_elapsed = sim_elapsed - uturn_start_time
             duration = UTURN_DURATION_S[uturn_direction]
@@ -1372,7 +1376,8 @@ def update(frame):
         if is_running and record_session:
             session_data.append([cmd_v_display, utest_enc_v_left if utest_active else real_enc1,
                                 utest_enc_v_right if utest_active else real_enc2,
-                                servo_deg - SERVO_CENTER, real_servo - SERVO_CENTER, stepper_pos, sf_state])
+                                servo_deg - SERVO_CENTER, real_servo - SERVO_CENTER, stepper_pos, sf_state,
+                                rear_x, rear_y, math.degrees(yaw), current_seg, uturn_active, uturn_direction])
 
         # Update grafik
         x_data = np.arange(len(history_v))

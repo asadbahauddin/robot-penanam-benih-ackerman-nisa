@@ -1216,7 +1216,7 @@ def update(frame):
         in_uturn_zone = any(lo <= current_seg < hi for (lo, hi) in uturn_ranges)
         if not uturn_active and in_uturn_zone and abs(math.degrees(steer_cmd)) > UTURN_ENGAGE_DEG:
             uturn_active = True
-            uturn_direction = 'R' if steer_cmd > 0 else 'L'
+            uturn_direction = 'L' if steer_cmd > 0 else 'R'  # tanda steer_cmd terbalik dari asumsi awal (terbukti dari log)
             uturn_start_time = sim_elapsed
             uturn_zone_lo, uturn_zone_hi = next((lo, hi) for (lo, hi) in uturn_ranges if lo <= current_seg <= hi)
             print(f"[UTURN ENGAGE] dir={uturn_direction} current_seg={current_seg} zone=({uturn_zone_lo},{uturn_zone_hi}) "

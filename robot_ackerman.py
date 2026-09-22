@@ -1547,5 +1547,5 @@ def on_close(event):
 
 fig.canvas.mpl_connect('close_event', on_close)
 
-ani = animation.FuncAnimation(fig, update, frames=None, interval=16, blit=True, cache_frame_data=False)
+ani = animation.FuncAnimation(fig, update, frames=None, interval=16, blit=False, cache_frame_data=False)
 plt.show()

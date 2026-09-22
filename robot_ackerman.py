@@ -1250,6 +1250,8 @@ def update(frame):
             else:
                 uturn_active = False
                 current_seg = uturn_zone_hi  # pastikan lepas full-lock pas mulai dari baris baru, bukan nyangkut di lengkungan
+                print(f"[UTURN EXIT] dir={uturn_direction} selesai @ t={sim_elapsed:.1f}s "
+                      f"current_seg={current_seg} pos=({rear_x:.3f},{rear_y:.3f}) yaw={math.degrees(yaw):.1f}°")
 
         servo_deg = map_steering_to_servo(steer, max_steer)
         if USE_HARDWARE and abs(steer) > math.radians(5):

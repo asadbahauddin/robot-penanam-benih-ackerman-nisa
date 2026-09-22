@@ -150,12 +150,16 @@ current_pwm = 0
 # Patokan utama: WAKTU (hasil video, langsung dipakai apa adanya). Kanan=27s terukur;
 # Kiri belum ada video, dipakai taksiran proporsional dari radius (23°) sampai ada data asli.
 UTURN_DURATION_S = {'R': 27.0, 'L': 17.0}  # <- ganti L begitu ada hasil video kiri
-UTURN_ENGAGE_DEG = 25  # kalau pure-pursuit minta steer > ini, dianggap U-turn -> banting full lock
+UTURN_ENGAGE_DEG = 8  # diturunkan dari 25 — kalau nunggu 25°, robot sudah keburu jalan jauh
+                       # secara organik di dalam zona sebelum full-lock nyala, bikin posisi
+                       # meloncat mundur ke titik awal zona pas di-snap. 8° cukup buat pastikan
+                       # arah (tanda steer_cmd) sudah jelas tapi trigger jauh lebih cepat.
 UTURN_PWM_FACTOR = 0.45  # kecepatan tetap selama full-lock — jangan pakai rumus steer_factor biasa (norm=1.0 -> nyaris 0 PWM)
 uturn_ranges = []  # diisi generate_seed_filler_path(): list of (start_idx, end_idx) segmen lengkung U-turn di `path`
 uturn_active = False
 uturn_direction = None
 uturn_start_time = 0.0
+uturn_a_start = 0.0
 uturn_zone_lo = 0
 uturn_zone_hi = 0
 servo_deg = SERVO_CENTER
@@ -1053,7 +1057,7 @@ def update_utest(real_dt):
 def update(frame):
     global rear_x, rear_y, yaw, steer, prev_steer, path_done, current_seg
     global stepper_pos, current_pwm, servo_deg, motor_dir, trajectory
-    global uturn_active, uturn_direction, uturn_start_time, uturn_zone_lo, uturn_zone_hi
+    global uturn_active, uturn_direction, uturn_start_time, uturn_zone_lo, uturn_zone_hi, uturn_a_start
     global last_update_time, fps_smooth, loop_count, fps_timer, sim_elapsed
     global ideal_x, ideal_y, ideal_yaw, utest_drift
     global utest_enc_v_left, utest_enc_v_right, utest_enc_v_linear, utest_enc_w_angular
@@ -1216,9 +1220,16 @@ def update(frame):
             uturn_direction = 'R' if steer_cmd > 0 else 'L'
             uturn_start_time = sim_elapsed
             uturn_zone_lo, uturn_zone_hi = next((lo, hi) for (lo, hi) in uturn_ranges if lo <= current_seg <= hi)
+            # Sudut awal sapuan diambil dari POSISI ASLI robot saat ini (relatif ke pusat
+            # lingkaran), BUKAN diasumsikan selalu -90°/titik awal zona. Kalau engage telat
+            # (robot sudah jalan organik masuk ke lengkungan sebelum threshold kecapai),
+            # ini mencegah posisi meloncat balik ke titik awal zona.
+            _uturn_r0 = ROW_SPACING / 2.0
+            _cx0, _cy0 = path[uturn_zone_lo][0], path[uturn_zone_lo][1] + _uturn_r0
+            uturn_a_start = math.atan2(rear_y - _cy0, rear_x - _cx0)
             print(f"[UTURN ENGAGE] dir={uturn_direction} current_seg={current_seg} zone=({uturn_zone_lo},{uturn_zone_hi}) "
                   f"pos_sebelum=({rear_x:.3f},{rear_y:.3f}) path[lo]=({path[uturn_zone_lo][0]:.3f},{path[uturn_zone_lo][1]:.3f}) "
-                  f"t={sim_elapsed:.1f}s")
+                  f"a_start={math.degrees(uturn_a_start):.1f}° t={sim_elapsed:.1f}s")
         if uturn_active:
             uturn_elapsed = sim_elapsed - uturn_start_time
             duration = UTURN_DURATION_S[uturn_direction]
@@ -1228,16 +1239,16 @@ def update(frame):
                 # Posisi & arah simulasi dihitung dari rumus geometri lingkaran yang PERSIS
                 # SAMA dengan yang dipakai generate_seed_filler_path() bikin titik cyan —
                 # pusat & radius diambil dari titik ujung baris (uturn_zone_lo, titik pasti/
-                # tidak meleset), disapu berdasar fraksi waktu murni. Dijamin bentuknya sama
-                # persis dengan lengkung cyan, tidak lagi bergantung index current_seg.
+                # tidak meleset), disapu berdasar fraksi waktu murni MULAI DARI uturn_a_start
+                # (posisi asli robot saat trigger), bukan dari titik awal zona secara mutlak.
                 frac = min(1.0, uturn_elapsed / duration)
                 uturn_r = ROW_SPACING / 2.0
                 cx, cy0 = path[uturn_zone_lo][0], path[uturn_zone_lo][1] + uturn_r
                 if uturn_direction == 'L':
-                    a = -math.pi / 2 + math.pi * frac   # CCW, menggembung +x (tepi kanan)
+                    a = uturn_a_start + math.pi * frac   # CCW, menggembung +x (tepi kanan)
                     pyaw = a + math.pi / 2
                 else:
-                    a = -math.pi / 2 - math.pi * frac   # CW, menggembung -x (tepi kiri)
+                    a = uturn_a_start - math.pi * frac   # CW, menggembung -x (tepi kiri)
                     pyaw = a - math.pi / 2
                 px = cx + uturn_r * math.cos(a)
                 py = cy0 + uturn_r * math.sin(a)
